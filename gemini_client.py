@@ -5,6 +5,13 @@ import httpx
 
 GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
+MODEL_FALLBACK_CHAIN = [
+    "gemini-flash-lite-latest",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+
 
 def build_prompt(topic: str, pages: int, lang: str) -> str:
     is_ar = lang == "ar"
@@ -27,7 +34,7 @@ def build_prompt(topic: str, pages: int, lang: str) -> str:
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("```"):
         text = text.strip("`")
         if text.startswith("json"):
@@ -39,26 +46,43 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+def _try_model(cfg, model: str, payload: dict, timeout: float) -> dict:
+    url = GENERATE_URL.format(model=model)
+    headers = {"x-goog-api-key": cfg.gemini_api_key}
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts)
+        return _extract_json(text)
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError("empty or malformed Gemini response") from exc
+
+
 def generate_report(cfg, topic: str, pages: int, lang: str) -> dict:
-    url = GENERATE_URL.format(model=cfg.gemini_model)
+    words = max(pages * 250, 400)
     payload = {
         "contents": [{"parts": [{"text": build_prompt(topic, pages, lang)}]}],
         "generationConfig": {
             "temperature": 0.8,
-            "maxOutputTokens": pages * 250 * 2 + 5000,
+            "maxOutputTokens": min(words * 2 + 2000, 60000),
         },
     }
-    headers = {"x-goog-api-key": cfg.gemini_api_key}
-    for attempt in range(3):
-        try:
-            with httpx.Client(timeout=180) as client:
-                resp = client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts)
-            return _extract_json(text)
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(2)
+    models = []
+    if cfg.gemini_model:
+        models.append(cfg.gemini_model)
+    for m in MODEL_FALLBACK_CHAIN:
+        if m not in models:
+            models.append(m)
+
+    errors = []
+    for model in models:
+        for attempt in range(2):
+            try:
+                return _try_model(cfg, model, payload, 240)
+            except Exception as exc:
+                errors.append(f"{model}: {exc}")
+                time.sleep(2)
+    raise RuntimeError("All Gemini models failed: " + "; ".join(errors[-8:]))
